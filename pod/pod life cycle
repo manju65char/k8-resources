@@ -909,4 +909,1063 @@ spec:
       - name: api
         image: myapi:latest
         env:
-        -
+        - name: DB_HOST
+          value: "external-postgres.amazonaws.com"
+        - name: CACHE_HOST
+          value: "redis-cluster.cache.amazonaws.com"
+        - name: S3_BUCKET
+          value: "my-app-storage"
+        # No persistent volumes - all data is external
+```
+
+#### StatefulSet Storage Patterns:
+
+**Individual Storage Pattern:**
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: database
+spec:
+  serviceName: database-headless
+  replicas: 3
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 100Gi
+  template:
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:13
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        - name: config
+          mountPath: /etc/postgresql
+      volumes:
+      - name: config
+        configMap:
+          name: postgres-config
+
+# Results in:
+# data-database-0 (100Gi PVC for pod-0)
+# data-database-1 (100Gi PVC for pod-1)
+# data-database-2 (100Gi PVC for pod-2)
+```
+
+**Multi-Volume Pattern:**
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+spec:
+  serviceName: elasticsearch-headless
+  replicas: 3
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 200Gi
+  - metadata:
+      name: logs
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 50Gi
+  template:
+    spec:
+      containers:
+      - name: elasticsearch
+        image: elasticsearch:7.10
+        volumeMounts:
+        - name: data
+          mountPath: /usr/share/elasticsearch/data
+        - name: logs
+          mountPath: /usr/share/elasticsearch/logs
+
+# Results in:
+# data-elasticsearch-0, logs-elasticsearch-0
+# data-elasticsearch-1, logs-elasticsearch-1
+# data-elasticsearch-2, logs-elasticsearch-2
+```
+
+### 3. Network Identity Patterns
+
+#### Deployment Network Identity:
+```bash
+# Pods have random, changing names
+my-app-deployment-7d4c8f9b6d-xk8pq
+my-app-deployment-7d4c8f9b6d-m2n9r
+my-app-deployment-7d4c8f9b6d-p7w3t
+
+# Service provides stable endpoint
+my-app-service.default.svc.cluster.local → Load balances to all pods
+
+# Individual pod access not guaranteed
+kubectl exec my-app-deployment-7d4c8f9b6d-xk8pq -- command
+# Pod name changes on restart/update
+```
+
+#### StatefulSet Network Identity:
+```bash
+# Pods have predictable, stable names
+database-0
+database-1
+database-2
+
+# Headless service provides individual DNS
+database-0.database-headless.default.svc.cluster.local
+database-1.database-headless.default.svc.cluster.local
+database-2.database-headless.default.svc.cluster.local
+
+# Names persist across restarts
+kubectl exec database-0 -- command
+# Always connects to the same logical pod
+```
+
+---
+
+## Communication Patterns
+
+### 1. Service-to-Pod Communication
+
+#### Load Balanced Communication (Deployment):
+```yaml
+# Regular Service for load balancing
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+spec:
+  selector:
+    app: web-app
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+
+# Communication pattern:
+# Client → Service (Load Balancer) → Random Pod
+```
+
+```python
+# Client code for load-balanced communication
+import requests
+
+# Always use service name - traffic goes to any pod
+response = requests.get("http://web-service.default.svc.cluster.local/api/users")
+
+# Kubernetes service load balances across all ready pods
+# No control over which pod receives the request
+```
+
+#### Direct Pod Communication (StatefulSet):
+```yaml
+# Headless Service for direct pod access
+apiVersion: v1
+kind: Service
+metadata:
+  name: database-headless
+spec:
+  clusterIP: None  # Makes it headless
+  selector:
+    app: database
+  ports:
+  - port: 5432
+    targetPort: 5432
+
+# Communication pattern:
+# Client → Direct Pod IP (No load balancer)
+```
+
+```python
+# Client code for direct pod communication
+import psycopg2
+
+# Connect to specific database pod (primary)
+primary_conn = psycopg2.connect(
+    host="database-0.database-headless.default.svc.cluster.local",
+    database="myapp",
+    user="app_user",
+    password="password"
+)
+
+# Connect to specific database pod (replica)
+replica_conn = psycopg2.connect(
+    host="database-1.database-headless.default.svc.cluster.local",
+    database="myapp",
+    user="app_user",
+    password="password"
+)
+
+# Write operations go to primary
+with primary_conn.cursor() as cursor:
+    cursor.execute("INSERT INTO users (name) VALUES (%s)", ("John",))
+    primary_conn.commit()
+
+# Read operations can go to replica
+with replica_conn.cursor() as cursor:
+    cursor.execute("SELECT * FROM users")
+    results = cursor.fetchall()
+```
+
+### 2. Service Discovery Patterns
+
+#### DNS-Based Service Discovery:
+```python
+import socket
+import dns.resolver
+
+def discover_all_pods(service_name, namespace="default"):
+    """Discover all pod IPs behind a headless service"""
+    fqdn = f"{service_name}.{namespace}.svc.cluster.local"
+    
+    try:
+        # Get all A records (pod IPs)
+        result = dns.resolver.resolve(fqdn, 'A')
+        pod_ips = [str(record) for record in result]
+        return pod_ips
+    except dns.resolver.NXDOMAIN:
+        return []
+
+def discover_individual_pods(statefulset_name, replicas, namespace="default"):
+    """Discover individual StatefulSet pods"""
+    pods = []
+    for i in range(replicas):
+        pod_fqdn = f"{statefulset_name}-{i}.{statefulset_name}-headless.{namespace}.svc.cluster.local"
+        try:
+            # Check if pod DNS exists
+            socket.gethostbyname(pod_fqdn)
+            pods.append(pod_fqdn)
+        except socket.gaierror:
+            # Pod doesn't exist or isn't ready
+            pass
+    return pods
+
+# Usage examples
+redis_pods = discover_all_pods("redis-cluster-headless")
+postgres_pods = discover_individual_pods("postgres", 3)
+
+print(f"Redis cluster pods: {redis_pods}")
+print(f"PostgreSQL pods: {postgres_pods}")
+```
+
+#### Kubernetes API Service Discovery:
+```python
+from kubernetes import client, config
+import json
+
+# Load cluster config
+config.load_incluster_config()  # When running inside cluster
+# config.load_kube_config()  # When running outside cluster
+
+v1 = client.CoreV1Api()
+
+def discover_pods_via_api(namespace="default", label_selector=None):
+    """Discover pods using Kubernetes API"""
+    try:
+        pods = v1.list_namespaced_pod(
+            namespace=namespace,
+            label_selector=label_selector
+        )
+        
+        pod_info = []
+        for pod in pods.items:
+            if pod.status.phase == "Running":
+                pod_info.append({
+                    "name": pod.metadata.name,
+                    "ip": pod.status.pod_ip,
+                    "node": pod.spec.node_name,
+                    "ready": all(condition.status == "True" 
+                               for condition in pod.status.conditions 
+                               if condition.type == "Ready")
+                })
+        return pod_info
+    except Exception as e:
+        print(f"Error discovering pods: {e}")
+        return []
+
+def get_endpoints(service_name, namespace="default"):
+    """Get service endpoints"""
+    try:
+        endpoints = v1.read_namespaced_endpoints(
+            name=service_name,
+            namespace=namespace
+        )
+        
+        addresses = []
+        if endpoints.subsets:
+            for subset in endpoints.subsets:
+                if subset.addresses:
+                    for address in subset.addresses:
+                        addresses.append({
+                            "ip": address.ip,
+                            "target_ref": address.target_ref.name if address.target_ref else None,
+                            "ready": True
+                        })
+                if subset.not_ready_addresses:
+                    for address in subset.not_ready_addresses:
+                        addresses.append({
+                            "ip": address.ip,
+                            "target_ref": address.target_ref.name if address.target_ref else None,
+                            "ready": False
+                        })
+        return addresses
+    except Exception as e:
+        print(f"Error getting endpoints: {e}")
+        return []
+
+# Usage examples
+database_pods = discover_pods_via_api(label_selector="app=database")
+web_endpoints = get_endpoints("web-service")
+
+print(f"Database pods: {json.dumps(database_pods, indent=2)}")
+print(f"Web service endpoints: {json.dumps(web_endpoints, indent=2)}")
+```
+
+### 3. Advanced Communication Patterns
+
+#### Circuit Breaker Pattern:
+```python
+import time
+import random
+from enum import Enum
+
+class CircuitState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold=5, recovery_timeout=60, success_threshold=2):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.success_threshold = success_threshold
+        self.failure_count = 0
+        self.success_count = 0
+        self.last_failure_time = None
+        self.state = CircuitState.CLOSED
+    
+    def call(self, func, *args, **kwargs):
+        if self.state == CircuitState.OPEN:
+            if time.time() - self.last_failure_time > self.recovery_timeout:
+                self.state = CircuitState.HALF_OPEN
+                self.success_count = 0
+            else:
+                raise Exception("Circuit breaker is OPEN")
+        
+        try:
+            result = func(*args, **kwargs)
+            self.on_success()
+            return result
+        except Exception as e:
+            self.on_failure()
+            raise e
+    
+    def on_success(self):
+        if self.state == CircuitState.HALF_OPEN:
+            self.success_count += 1
+            if self.success_count >= self.success_threshold:
+                self.state = CircuitState.CLOSED
+                self.failure_count = 0
+        elif self.state == CircuitState.CLOSED:
+            self.failure_count = 0
+    
+    def on_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        
+        if self.failure_count >= self.failure_threshold:
+            self.state = CircuitState.OPEN
+
+# Usage with database connections
+db_circuit_breaker = CircuitBreaker()
+
+def connect_to_database():
+    """Potentially failing database connection"""
+    if random.random() < 0.3:  # Simulate 30% failure rate
+        raise Exception("Database connection failed")
+    return "Connected to database"
+
+# Protected database calls
+try:
+    result = db_circuit_breaker.call(connect_to_database)
+    print(f"Success: {result}")
+except Exception as e:
+    print(f"Failed: {e}")
+```
+
+#### Retry with Exponential Backoff:
+```python
+import time
+import random
+import requests
+from functools import wraps
+
+def retry_with_backoff(max_retries=3, base_delay=1, max_delay=60, backoff_factor=2):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries:
+                        raise e
+                    
+                    # Calculate delay with exponential backoff and jitter
+                    delay = min(base_delay * (backoff_factor ** attempt), max_delay)
+                    jitter = random.uniform(0, delay * 0.1)  # Add 10% jitter
+                    total_delay = delay + jitter
+                    
+                    print(f"Attempt {attempt + 1} failed: {e}. Retrying in {total_delay:.2f}s...")
+                    time.sleep(total_delay)
+            
+            return None
+        return wrapper
+    return decorator
+
+@retry_with_backoff(max_retries=3, base_delay=1, backoff_factor=2)
+def call_external_service():
+    """Call external service with retry logic"""
+    response = requests.get("http://external-api.example.com/health", timeout=5)
+    response.raise_for_status()
+    return response.json()
+
+# Usage
+try:
+    result = call_external_service()
+    print(f"Service response: {result}")
+except Exception as e:
+    print(f"All retries failed: {e}")
+```
+
+#### Load Balancing with Health Checks:
+```python
+import requests
+import time
+import threading
+from collections import defaultdict
+
+class HealthAwareLoadBalancer:
+    def __init__(self, endpoints, health_check_interval=30):
+        self.endpoints = endpoints
+        self.healthy_endpoints = set(endpoints)
+        self.endpoint_weights = defaultdict(lambda: 1.0)
+        self.health_check_interval = health_check_interval
+        self.current_index = 0
+        self.lock = threading.Lock()
+        
+        # Start health checking thread
+        self.health_check_thread = threading.Thread(target=self._health_check_loop)
+        self.health_check_thread.daemon = True
+        self.health_check_thread.start()
+    
+    def _health_check_loop(self):
+        while True:
+            self._check_endpoint_health()
+            time.sleep(self.health_check_interval)
+    
+    def _check_endpoint_health(self):
+        healthy = set()
+        for endpoint in self.endpoints:
+            try:
+                response = requests.get(f"http://{endpoint}/health", timeout=5)
+                if response.status_code == 200:
+                    healthy.add(endpoint)
+                    # Adjust weight based on response time
+                    response_time = response.elapsed.total_seconds()
+                    self.endpoint_weights[endpoint] = 1.0 / max(response_time, 0.001)
+            except Exception:
+                # Endpoint is unhealthy
+                pass
+        
+        with self.lock:
+            self.healthy_endpoints = healthy
+    
+    def get_endpoint(self, strategy="round_robin"):
+        with self.lock:
+            if not self.healthy_endpoints:
+                raise Exception("No healthy endpoints available")
+            
+            healthy_list = list(self.healthy_endpoints)
+            
+            if strategy == "round_robin":
+                endpoint = healthy_list[self.current_index % len(healthy_list)]
+                self.current_index += 1
+                return endpoint
+            elif strategy == "weighted":
+                # Weighted selection based on response times
+                weights = [self.endpoint_weights[ep] for ep in healthy_list]
+                total_weight = sum(weights)
+                if total_weight == 0:
+                    return healthy_list[0]
+                
+                import random
+                r = random.uniform(0, total_weight)
+                cumulative = 0
+                for i, weight in enumerate(weights):
+                    cumulative += weight
+                    if r <= cumulative:
+                        return healthy_list[i]
+                return healthy_list[-1]
+            else:
+                import random
+                return random.choice(healthy_list)
+
+# Usage with StatefulSet pods
+database_endpoints = [
+    "database-0.database-headless.default.svc.cluster.local:5432",
+    "database-1.database-headless.default.svc.cluster.local:5432",
+    "database-2.database-headless.default.svc.cluster.local:5432"
+]
+
+lb = HealthAwareLoadBalancer(database_endpoints)
+
+# Get healthy endpoint for connection
+try:
+    endpoint = lb.get_endpoint(strategy="weighted")
+    print(f"Connecting to: {endpoint}")
+except Exception as e:
+    print(f"No healthy endpoints: {e}")
+```
+
+---
+
+## Production Scenarios
+
+### 1. Multi-Tier Application with Mixed Workloads
+
+```yaml
+# Frontend (Deployment - Stateless)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: production
+spec:
+  replicas: 5
+  strategy:
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: frontend
+      tier: web
+  template:
+    metadata:
+      labels:
+        app: frontend
+        tier: web
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.21-alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+# API Layer (Deployment - Stateless)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: production
+spec:
+  replicas: 10
+  strategy:
+    rollingUpdate:
+      maxSurge: 3
+      maxUnavailable: 2
+  selector:
+    matchLabels:
+      app: api-server
+      tier: backend
+  template:
+    metadata:
+      labels:
+        app: api-server
+        tier: backend
+    spec:
+      containers:
+      - name: api
+        image: mycompany/api:v2.1.0
+        ports:
+        - containerPort: 8080
+        env:
+        - name: DB_PRIMARY_HOST
+          value: "postgres-0.postgres-headless.production.svc.cluster.local"
+        - name: DB_REPLICA_HOST
+          value: "postgres-1.postgres-headless.production.svc.cluster.local"
+        - name: REDIS_CLUSTER
+          value: "redis-0.redis-headless.production.svc.cluster.local:6379,redis-1.redis-headless.production.svc.cluster.local:6379,redis-2.redis-headless.production.svc.cluster.local:6379"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        startupProbe:
+          httpGet:
+            path: /health/startup
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 300
+          periodSeconds: 30
+          timeoutSeconds: 10
+
+---
+# Database (StatefulSet - Stateful)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: production
+spec:
+  serviceName: postgres-headless
+  replicas: 3
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  selector:
+    matchLabels:
+      app: postgres
+      tier: database
+  template:
+    metadata:
+      labels:
+        app: postgres
+        tier: database
+    spec:
+      initContainers:
+      - name: setup-replication
+        image: postgres:13-alpine
+        command:
+        - /bin/bash
+        - -c
+        - |
+          if [[ $HOSTNAME == "postgres-0" ]]; then
+            echo "Setting up as primary"
+            echo "primary_conninfo = ''" > /tmp/postgresql.conf
+          else
+            echo "Setting up as replica"
+            echo "primary_conninfo = 'host=postgres-0.postgres-headless.production.svc.cluster.local port=5432 user=replicator'" > /tmp/postgresql.conf
+          fi
+        volumeMounts:
+        - name: config
+          mountPath: /tmp
+      containers:
+      - name: postgres
+        image: postgres:13-alpine
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: "myapp_production"
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: username
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: password
+        - name: PGDATA
+          value: "/var/lib/postgresql/data/pgdata"
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        - name: config
+          mountPath: /etc/postgresql
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        startupProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - $(POSTGRES_USER)
+            - -d
+            - $(POSTGRES_DB)
+          initialDelaySeconds: 60
+          periodSeconds: 15
+          failureThreshold: 40
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - $(POSTGRES_USER)
+            - -d
+            - $(POSTGRES_DB)
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - $(POSTGRES_USER)
+            - -d
+            - $(POSTGRES_DB)
+          initialDelaySeconds: 300
+          periodSeconds: 30
+          timeoutSeconds: 10
+      volumes:
+      - name: config
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 500Gi
+
+---
+# Cache (StatefulSet - Distributed)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: production
+spec:
+  serviceName: redis-headless
+  replicas: 6
+  selector:
+    matchLabels:
+      app: redis
+      tier: cache
+  template:
+    metadata:
+      labels:
+        app: redis
+        tier: cache
+    spec:
+      initContainers:
+      - name: setup-cluster
+        image: redis:6-alpine
+        command:
+        - /bin/sh
+        - -c
+        - |
+          # Wait for all pods to be created
+          while [ $(nslookup redis-headless.production.svc.cluster.local | grep -c "Address:") -lt 6 ]; do
+            echo "Waiting for all Redis pods..."
+            sleep 5
+          done
+          
+          # Only first pod initializes cluster
+          if [[ $HOSTNAME == "redis-0" ]]; then
+            echo "Initializing Redis cluster..."
+            redis-cli --cluster create \
+              redis-0.redis-headless.production.svc.cluster.local:6379 \
+              redis-1.redis-headless.production.svc.cluster.local:6379 \
+              redis-2.redis-headless.production.svc.cluster.local:6379 \
+              redis-3.redis-headless.production.svc.cluster.local:6379 \
+              redis-4.redis-headless.production.svc.cluster.local:6379 \
+              redis-5.redis-headless.production.svc.cluster.local:6379 \
+              --cluster-replicas 1 --cluster-yes || true
+          fi
+      containers:
+      - name: redis
+        image: redis:6-alpine
+        ports:
+        - containerPort: 6379
+        - containerPort: 16379  # Cluster bus port
+        command:
+        - redis-server
+        - --cluster-enabled
+        - "yes"
+        - --cluster-config-file
+        - nodes.conf
+        - --cluster-node-timeout
+        - "15000"
+        - --appendonly
+        - "yes"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        startupProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 30
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 180
+          periodSeconds: 30
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: standard-ssd
+      resources:
+        requests:
+          storage: 100Gi
+```
+
+### 2. Services Configuration
+
+```yaml
+# Frontend Service (LoadBalancer)
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+  namespace: production
+spec:
+  selector:
+    app: frontend
+    tier: web
+  ports:
+  - port: 80
+    targetPort: 80
+  type: LoadBalancer
+
+---
+# API Service (ClusterIP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: production
+spec:
+  selector:
+    app: api-server
+    tier: backend
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP
+
+---
+# PostgreSQL Headless Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: production
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+    tier: database
+  ports:
+  - port: 5432
+    targetPort: 5432
+
+---
+# PostgreSQL Primary Service (for writes)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-primary
+  namespace: production
+spec:
+  selector:
+    app: postgres
+    tier: database
+    statefulset.kubernetes.io/pod-name: postgres-0
+  ports:
+  - port: 5432
+    targetPort: 5432
+  type: ClusterIP
+
+---
+# Redis Headless Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: production
+spec:
+  clusterIP: None
+  selector:
+    app: redis
+    tier: cache
+  ports:
+  - port: 6379
+    targetPort: 6379
+  - port: 16379
+    targetPort: 16379
+```
+
+---
+
+## Expert Troubleshooting
+
+### 1. Deployment Issues
+
+#### Pod Stuck in Pending:
+```bash
+# Check pod status
+kubectl describe pod <pod-name> -n <namespace>
+
+# Common issues and solutions:
+# 1. Resource constraints
+kubectl describe nodes
+kubectl top nodes
+
+# 2. Image pull issues
+kubectl get events --field-selector involvedObject.name=<pod-name>
+
+# 3. PVC binding issues
+kubectl get pvc -n <namespace>
+kubectl describe pvc <pvc-name> -n <namespace>
+
+# 4. Node selector/affinity issues
+kubectl get nodes --show-labels
+```
+
+#### Rolling Update Stuck:
+```bash
+# Check rollout status
+kubectl rollout status deployment/<deployment-name> -n <namespace>
+
+# Check rollout history
+kubectl rollout history deployment/<deployment-name> -n <namespace>
+
+# Check replica sets
+kubectl get rs -n <namespace>
+
+# Debug stuck rollout
+kubectl describe deployment <deployment-name> -n <namespace>
+
+# Force rollout restart
+kubectl rollout restart deployment/<deployment-name> -n <namespace>
+
+# Rollback if needed
+kubectl rollout undo deployment/<deployment-name> -n <namespace>
+```
+
+### 2. StatefulSet Issues
+
+#### Pod Startup Order Problems:
+```bash
+# Check StatefulSet status
+kubectl get statefulset -n <namespace>
+kubectl describe statefulset <sts-name> -n <namespace>
+
+# Check individual pod status
+kubectl get pods -l app=<app-name> -n <namespace> -o wide
+
+# Check pod readiness gates
+kubectl describe pod <pod-name> -n <namespace> | grep -A5 "Readiness Gates"
+
+# Manual intervention for stuck pod
+kubectl delete pod <pod-name> -n <namespace>
+# StatefulSet will recreate with same name and PVC
+```
+
+#### PVC Issues:
+```bash
+# List PVCs for StatefulSet
+kubectl get pvc -l app=<app-name> -n <namespace>
+
+# Check PVC binding
+kubectl describe pvc <pvc-name> -n <namespace>
+
+# Check PV status
+kubectl get pv
+
+# Force PVC deletion (dangerous!)
+kubectl patch pvc <pvc-name> -n <namespace> -p '{"metadata":{"finalizers":null}}'
+
+# Resize PVC (if storage class supports it)
+kubectl patch pvc <pvc-name> -n <namespace> -p '{"spec":{"resources":{"requests":{"storage":"200Gi"}}}}'
+```
+
+### 3. Health Check Issues
+
+#### Probe Failures:
+```bash
+# Check probe configuration
+kubectl describe pod <pod-name> -n <namespace> | grep -A10 "Liveness\|Readiness\|Startup"
+
+# Check probe logs
+kubectl logs <pod-name> -n <namespace> --previous
+
+# Test probe manually
+kubectl exec <pod-name> -n <namespace> -- curl -f http://localhost:8080/health
+
+# Debug with temporary pod
+kubectl run debug --image=busybox -it --rm -- sh
+# From inside: wget -qO- http://<pod-
