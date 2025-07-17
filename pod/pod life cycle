@@ -1,0 +1,912 @@
+# Kubernetes Expert Guide: Complete Application Flow, Health Checks & Communication
+
+## Table of Contents
+1. [Application Flow Deep Dive](#application-flow-deep-dive)
+2. [Health Checks Mastery](#health-checks-mastery)
+3. [Deployment vs StatefulSet Expert Analysis](#deployment-vs-statefulset-expert-analysis)
+4. [Communication Patterns](#communication-patterns)
+5. [Production Scenarios](#production-scenarios)
+6. [Expert Troubleshooting](#expert-troubleshooting)
+
+---
+
+## Application Flow Deep Dive
+
+### 1. Deployment Application Flow
+
+#### Complete Lifecycle Flow:
+```
+┌─────────────────┐
+│  kubectl apply  │
+│  deployment.yaml│
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ API Server      │ ← Validates YAML, stores in etcd
+│ Processes       │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Deployment      │ ← Watches for Deployment objects
+│ Controller      │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ ReplicaSet      │ ← Creates ReplicaSet with desired replicas
+│ Created         │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ ReplicaSet      │ ← Watches for ReplicaSet objects
+│ Controller      │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Pod Objects     │ ← Creates Pod objects in etcd
+│ Created         │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Scheduler       │ ← Assigns pods to nodes
+│ Assigns Nodes   │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Kubelet         │ ← Pulls images, starts containers
+│ Starts Pods     │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Container       │ ← Runs init containers first
+│ Runtime         │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Health Probes   │ ← Startup → Readiness → Liveness
+│ Begin           │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Service         │ ← Adds pod to service endpoints
+│ Registration    │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Pod Ready       │ ← Receives production traffic
+│ For Traffic     │
+└─────────────────┘
+```
+
+#### Detailed Component Interactions:
+
+**API Server Phase:**
+```bash
+# What happens internally
+1. YAML validation against schema
+2. Admission controllers run (mutating → validating)
+3. Object stored in etcd
+4. Controllers notified via watch API
+```
+
+**Deployment Controller Phase:**
+```bash
+# Controller logic
+1. Watches for Deployment events
+2. Calculates desired state vs current state
+3. Creates/updates ReplicaSet
+4. Manages rolling updates
+5. Handles rollback scenarios
+```
+
+**ReplicaSet Controller Phase:**
+```bash
+# ReplicaSet management
+1. Watches for ReplicaSet events
+2. Counts current pods vs desired replicas
+3. Creates new pods if needed
+4. Deletes excess pods if needed
+5. Updates ReplicaSet status
+```
+
+#### Scaling Event Flow:
+```
+Scale Command: kubectl scale deployment myapp --replicas=5
+
+Current State: 3 pods running
+Desired State: 5 pods running
+Difference: +2 pods needed
+
+Flow:
+┌─────────────────┐
+│ Deployment      │ ← Replica count updated
+│ Spec Updated    │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ ReplicaSet      │ ← Controller calculates diff
+│ Controller      │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ 2 New Pods      │ ← Pod objects created
+│ Created         │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Scheduler       │ ← Finds nodes for new pods
+│ Places Pods     │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Kubelet         │ ← Starts containers
+│ Executes        │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Health Checks   │ ← Probes run, pods become ready
+│ Pass            │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Service         │ ← New pods added to load balancer
+│ Updated         │
+└─────────────────┘
+```
+
+### 2. StatefulSet Application Flow
+
+#### Complete Lifecycle Flow:
+```
+┌─────────────────┐
+│  kubectl apply  │
+│ statefulset.yaml│
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ API Server      │ ← Validates YAML, stores in etcd
+│ Processes       │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ StatefulSet     │ ← Watches for StatefulSet objects
+│ Controller      │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Pod-0 Created   │ ← Creates first pod (myapp-0)
+│ (Sequential)    │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ PVC Created     │ ← Creates PVC for pod-0
+│ (If Template)   │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Scheduler       │ ← Assigns pod-0 to node
+│ Places Pod-0    │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Kubelet Starts  │ ← Starts pod-0 container
+│ Pod-0           │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Pod-0 Health    │ ← Probes run for pod-0
+│ Checks Pass     │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Pod-0 Ready     │ ← Pod-0 marked ready
+│ (Running)       │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Pod-1 Created   │ ← Only after pod-0 is ready
+│ (Sequential)    │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Process Repeats │ ← Continues for each replica
+│ For Each Pod    │
+└─────────────────┘
+```
+
+#### Sequential Startup Detail:
+```
+Time: 0s
+┌─────────────────┐
+│ StatefulSet     │
+│ Created         │
+│ Replicas: 3     │
+└─────────┬───────┘
+          │
+Time: 0s  ▼
+┌─────────────────┐
+│ myapp-0         │ ← First pod created
+│ Status: Pending │
+└─────────┬───────┘
+          │
+Time: 30s ▼
+┌─────────────────┐
+│ myapp-0         │ ← First pod ready
+│ Status: Running │
+└─────────┬───────┘
+          │
+Time: 30s ▼
+┌─────────────────┐
+│ myapp-1         │ ← Second pod created only after first is ready
+│ Status: Pending │
+└─────────┬───────┘
+          │
+Time: 60s ▼
+┌─────────────────┐
+│ myapp-1         │ ← Second pod ready
+│ Status: Running │
+└─────────┬───────┘
+          │
+Time: 60s ▼
+┌─────────────────┐
+│ myapp-2         │ ← Third pod created only after second is ready
+│ Status: Pending │
+└─────────────────┘
+```
+
+#### Scaling Down Flow:
+```
+Scale Down Command: kubectl scale statefulset myapp --replicas=1
+
+Current: myapp-0, myapp-1, myapp-2 (3 pods)
+Target: myapp-0 (1 pod)
+
+Deletion Order (Reverse):
+┌─────────────────┐
+│ myapp-2         │ ← Deleted first (highest ordinal)
+│ Terminating     │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ myapp-2         │ ← Graceful shutdown period
+│ Grace Period    │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ myapp-2         │ ← Pod fully terminated
+│ Terminated      │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ myapp-1         │ ← Next pod deleted (only after myapp-2 is gone)
+│ Terminating     │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ myapp-0         │ ← Final pod remains
+│ Running         │
+└─────────────────┘
+```
+
+---
+
+## Health Checks Mastery
+
+### 1. Probe Execution Flow
+
+#### Container Startup with All Probes:
+```
+Container Start (t=0)
+        │
+        ▼
+┌─────────────────┐
+│ Container       │ ← Process starts
+│ Process Starts  │
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐
+│ Startup Probe   │ ← ONLY startup probe runs
+│ Starts          │   (Others disabled)
+│ (t=initialDelay)│
+└─────────┬───────┘
+          │
+          ▼
+┌─────────────────┐     SUCCESS     ┌─────────────────┐
+│ Startup Probe   │─────────────────▶│ Startup Probe   │
+│ Checks Health   │                  │ Succeeds        │
+└─────────┬───────┘                  └─────────┬───────┘
+          │ FAILURE                            │
+          ▼                                    ▼
+┌─────────────────┐                  ┌─────────────────┐
+│ Wait Period     │                  │ Readiness Probe │
+│ (periodSeconds) │                  │ Starts          │
+└─────────┬───────┘                  └─────────┬───────┘
+          │                                    │
+          ▼                                    ▼
+┌─────────────────┐                  ┌─────────────────┐
+│ Retry Startup   │                  │ Liveness Probe  │
+│ Probe           │                  │ Starts          │
+└─────────┬───────┘                  └─────────────────┘
+          │
+          ▼
+┌─────────────────┐
+│ failureThreshold│ ← If exceeded, container restarts
+│ Reached?        │
+└─────────────────┘
+```
+
+#### Probe State Machine:
+```
+┌─────────────────┐
+│ STARTUP PHASE   │
+│                 │
+│ Startup: Active │
+│Readiness: Disabled│
+│Liveness: Disabled│
+└─────────┬───────┘
+          │ Startup Success
+          ▼
+┌─────────────────┐
+│ READY PHASE     │
+│                 │
+│ Startup: Done   │
+│Readiness: Active│
+│Liveness: Active │
+└─────────┬───────┘
+          │ Both Running
+          ▼
+┌─────────────────┐
+│ HEALTHY PHASE   │
+│                 │
+│ Startup: Done   │
+│Readiness: Passing│
+│Liveness: Passing│
+└─────────┬───────┘
+          │ Readiness Fails
+          ▼
+┌─────────────────┐
+│ DEGRADED PHASE  │
+│                 │
+│ Startup: Done   │
+│Readiness: Failing│
+│Liveness: Passing│
+└─────────┬───────┘
+          │ Liveness Fails
+          ▼
+┌─────────────────┐
+│ RESTART PHASE   │
+│                 │
+│ Container       │
+│ Restarted       │
+└─────────────────┘
+```
+
+### 2. Probe Types Deep Dive
+
+#### Startup Probe Implementation:
+```yaml
+# Database startup probe (PostgreSQL)
+startupProbe:
+  exec:
+    command:
+    - /bin/sh
+    - -c
+    - |
+      # Check if PostgreSQL is accepting connections
+      pg_isready -U $POSTGRES_USER -d $POSTGRES_DB
+      
+      # Additional checks for full readiness
+      if [ $? -eq 0 ]; then
+        # Check if database is not in recovery mode
+        psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT pg_is_in_recovery();" | grep -q "f"
+      fi
+  initialDelaySeconds: 30   # Wait 30s before first check
+  periodSeconds: 15         # Check every 15s
+  timeoutSeconds: 10        # Allow 10s for command to complete
+  failureThreshold: 40      # Allow 40 failures = 10 minutes
+  successThreshold: 1       # One success = startup complete
+```
+
+#### Readiness Probe Implementation:
+```yaml
+# Web application readiness probe
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+    httpHeaders:
+    - name: User-Agent
+      value: k8s-readiness-probe
+    - name: Accept
+      value: application/json
+  initialDelaySeconds: 5    # Start checking after 5s
+  periodSeconds: 10         # Check every 10s
+  timeoutSeconds: 5         # 5s timeout
+  failureThreshold: 3       # 3 failures = remove from service
+  successThreshold: 1       # 1 success = add to service
+```
+
+#### Liveness Probe Implementation:
+```yaml
+# Application liveness probe with multiple checks
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8080
+    httpHeaders:
+    - name: User-Agent
+      value: k8s-liveness-probe
+  initialDelaySeconds: 300  # Wait 5 minutes before first check
+  periodSeconds: 60         # Check every minute
+  timeoutSeconds: 30        # Allow 30s for response
+  failureThreshold: 3       # 3 failures = restart container
+  successThreshold: 1       # 1 success = healthy
+```
+
+### 3. Health Check Endpoint Design
+
+#### Comprehensive Health Check Implementation:
+```python
+from flask import Flask, jsonify
+import psycopg2
+import redis
+import requests
+import threading
+import time
+from datetime import datetime, timedelta
+
+app = Flask(__name__)
+
+# Global state tracking
+startup_complete = False
+last_db_check = None
+last_cache_check = None
+last_downstream_check = None
+error_count = 0
+max_errors = 5
+
+class HealthChecker:
+    def __init__(self):
+        self.db_pool = None
+        self.redis_client = None
+        self.downstream_services = [
+            "http://user-service:8080/health",
+            "http://order-service:8080/health"
+        ]
+        
+    def check_database(self):
+        """Check database connectivity and performance"""
+        try:
+            conn = psycopg2.connect(
+                host="postgres-service",
+                database="myapp",
+                user="app_user",
+                password="password"
+            )
+            cursor = conn.cursor()
+            
+            # Test basic connectivity
+            cursor.execute("SELECT 1")
+            result = cursor.fetchone()
+            
+            # Test response time
+            start_time = time.time()
+            cursor.execute("SELECT COUNT(*) FROM users")
+            response_time = time.time() - start_time
+            
+            cursor.close()
+            conn.close()
+            
+            return {
+                "status": "healthy",
+                "response_time": response_time,
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            return {
+                "status": "unhealthy",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+    
+    def check_cache(self):
+        """Check Redis cache connectivity"""
+        try:
+            r = redis.Redis(host='redis-service', port=6379, db=0)
+            
+            # Test basic connectivity
+            r.ping()
+            
+            # Test read/write
+            test_key = "health_check_" + str(int(time.time()))
+            r.set(test_key, "test_value", ex=10)
+            value = r.get(test_key)
+            r.delete(test_key)
+            
+            return {
+                "status": "healthy",
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            return {
+                "status": "unhealthy",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+    
+    def check_downstream_services(self):
+        """Check downstream service health"""
+        results = {}
+        for service_url in self.downstream_services:
+            try:
+                response = requests.get(service_url, timeout=5)
+                results[service_url] = {
+                    "status": "healthy" if response.status_code == 200 else "unhealthy",
+                    "status_code": response.status_code,
+                    "timestamp": datetime.now().isoformat()
+                }
+            except Exception as e:
+                results[service_url] = {
+                    "status": "unhealthy",
+                    "error": str(e),
+                    "timestamp": datetime.now().isoformat()
+                }
+        return results
+
+health_checker = HealthChecker()
+
+@app.route('/health/startup')
+def startup_health():
+    """Startup probe endpoint"""
+    global startup_complete
+    
+    if startup_complete:
+        return jsonify({"status": "ready"}), 200
+    
+    try:
+        # Check critical startup requirements
+        checks = {
+            "database": health_checker.check_database(),
+            "cache": health_checker.check_cache(),
+            "config": {"status": "healthy"}  # Check configuration loading
+        }
+        
+        # All critical components must be healthy
+        if all(check["status"] == "healthy" for check in checks.values()):
+            startup_complete = True
+            return jsonify({
+                "status": "ready",
+                "checks": checks,
+                "timestamp": datetime.now().isoformat()
+            }), 200
+        else:
+            return jsonify({
+                "status": "not_ready",
+                "checks": checks,
+                "timestamp": datetime.now().isoformat()
+            }), 503
+            
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 503
+
+@app.route('/health/ready')
+def readiness_health():
+    """Readiness probe endpoint"""
+    global last_db_check, last_cache_check, last_downstream_check
+    
+    try:
+        # Check if we can serve traffic
+        checks = {
+            "database": health_checker.check_database(),
+            "cache": health_checker.check_cache(),
+            "downstream": health_checker.check_downstream_services()
+        }
+        
+        # Update last check times
+        last_db_check = datetime.now()
+        last_cache_check = datetime.now()
+        last_downstream_check = datetime.now()
+        
+        # Determine if ready based on critical vs non-critical dependencies
+        critical_healthy = checks["database"]["status"] == "healthy"
+        cache_healthy = checks["cache"]["status"] == "healthy"
+        
+        # Can serve traffic if critical components are healthy
+        # Cache is important but not critical
+        if critical_healthy:
+            if cache_healthy:
+                status = "ready"
+                http_code = 200
+            else:
+                status = "degraded"  # Can serve traffic but performance may be poor
+                http_code = 200
+        else:
+            status = "not_ready"
+            http_code = 503
+        
+        return jsonify({
+            "status": status,
+            "checks": checks,
+            "timestamp": datetime.now().isoformat()
+        }), http_code
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 503
+
+@app.route('/health/live')
+def liveness_health():
+    """Liveness probe endpoint"""
+    global error_count
+    
+    try:
+        # Check if application is functioning properly
+        checks = {
+            "memory": check_memory_usage(),
+            "threads": check_thread_health(),
+            "recent_requests": check_recent_request_success(),
+            "deadlocks": check_for_deadlocks()
+        }
+        
+        # Count unhealthy checks
+        unhealthy_count = sum(1 for check in checks.values() if check["status"] != "healthy")
+        
+        if unhealthy_count == 0:
+            error_count = 0  # Reset error count on healthy check
+            return jsonify({
+                "status": "healthy",
+                "checks": checks,
+                "timestamp": datetime.now().isoformat()
+            }), 200
+        else:
+            error_count += 1
+            if error_count >= max_errors:
+                # Application is consistently unhealthy - needs restart
+                return jsonify({
+                    "status": "unhealthy",
+                    "checks": checks,
+                    "error_count": error_count,
+                    "timestamp": datetime.now().isoformat()
+                }), 503
+            else:
+                # Some issues but not consistently failing
+                return jsonify({
+                    "status": "degraded",
+                    "checks": checks,
+                    "error_count": error_count,
+                    "timestamp": datetime.now().isoformat()
+                }), 200
+                
+    except Exception as e:
+        error_count += 1
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "error_count": error_count,
+            "timestamp": datetime.now().isoformat()
+        }), 503
+
+def check_memory_usage():
+    """Check memory usage"""
+    import psutil
+    memory = psutil.virtual_memory()
+    if memory.percent > 90:
+        return {"status": "unhealthy", "memory_percent": memory.percent}
+    elif memory.percent > 75:
+        return {"status": "degraded", "memory_percent": memory.percent}
+    else:
+        return {"status": "healthy", "memory_percent": memory.percent}
+
+def check_thread_health():
+    """Check thread pool health"""
+    import threading
+    active_threads = threading.active_count()
+    if active_threads > 100:
+        return {"status": "unhealthy", "active_threads": active_threads}
+    else:
+        return {"status": "healthy", "active_threads": active_threads}
+
+def check_recent_request_success():
+    """Check recent request success rate"""
+    # This would integrate with your metrics system
+    # For demo purposes, returning healthy
+    return {"status": "healthy", "success_rate": 0.95}
+
+def check_for_deadlocks():
+    """Check for application deadlocks"""
+    # This would implement deadlock detection logic
+    # For demo purposes, returning healthy
+    return {"status": "healthy", "deadlocks": 0}
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
+```
+
+### 4. Advanced Probe Patterns
+
+#### Circuit Breaker Pattern in Readiness:
+```python
+class CircuitBreaker:
+    def __init__(self, failure_threshold=5, recovery_timeout=60):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+    
+    def call(self, func):
+        if self.state == "OPEN":
+            if time.time() - self.last_failure_time > self.recovery_timeout:
+                self.state = "HALF_OPEN"
+            else:
+                raise Exception("Circuit breaker is OPEN")
+        
+        try:
+            result = func()
+            if self.state == "HALF_OPEN":
+                self.state = "CLOSED"
+                self.failure_count = 0
+            return result
+        except Exception as e:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            if self.failure_count >= self.failure_threshold:
+                self.state = "OPEN"
+            raise e
+
+# Usage in readiness probe
+db_circuit_breaker = CircuitBreaker()
+
+@app.route('/health/ready')
+def readiness_with_circuit_breaker():
+    try:
+        db_check = db_circuit_breaker.call(health_checker.check_database)
+        return jsonify({"status": "ready", "database": db_check}), 200
+    except Exception:
+        return jsonify({"status": "not_ready", "reason": "database_circuit_open"}), 503
+```
+
+---
+
+## Deployment vs StatefulSet Expert Analysis
+
+### 1. Internal Architecture Differences
+
+#### Deployment Architecture:
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Deployment                           │
+│                                                             │
+│  ┌─────────────────┐    ┌─────────────────┐                │
+│  │   ReplicaSet    │    │   ReplicaSet    │                │
+│  │   (Current)     │    │   (Previous)    │                │
+│  │                 │    │                 │                │
+│  │ ┌─────────────┐ │    │ ┌─────────────┐ │                │
+│  │ │    Pod      │ │    │ │    Pod      │ │                │
+│  │ │ (random-1)  │ │    │ │ (random-2)  │ │                │
+│  │ └─────────────┘ │    │ └─────────────┘ │                │
+│  │ ┌─────────────┐ │    │ ┌─────────────┐ │                │
+│  │ │    Pod      │ │    │ │    Pod      │ │                │
+│  │ │ (random-3)  │ │    │ │ (random-4)  │ │                │
+│  │ └─────────────┘ │    │ └─────────────┘ │                │
+│  └─────────────────┘    └─────────────────┘                │
+└─────────────────────────────────────────────────────────────┘
+
+Rolling Update Process:
+1. Create new ReplicaSet
+2. Scale up new ReplicaSet gradually
+3. Scale down old ReplicaSet gradually
+4. Pods can be killed in any order
+5. New pods can start before old pods terminate
+```
+
+#### StatefulSet Architecture:
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      StatefulSet                            │
+│                                                             │
+│  ┌─────────────────┐    ┌─────────────────┐                │
+│  │     Pod-0       │    │     Pod-1       │                │
+│  │  (Persistent)   │    │  (Persistent)   │                │
+│  │                 │    │                 │                │
+│  │ ┌─────────────┐ │    │ ┌─────────────┐ │                │
+│  │ │    PVC      │ │    │ │    PVC      │ │                │
+│  │ │  (data-0)   │ │    │ │  (data-1)   │ │                │
+│  │ └─────────────┘ │    │ └─────────────┘ │                │
+│  │ ┌─────────────┐ │    │ ┌─────────────┐ │                │
+│  │ │  Network    │ │    │ │  Network    │ │                │
+│  │ │  Identity   │ │    │ │  Identity   │ │                │
+│  │ └─────────────┘ │    │ └─────────────┘ │                │
+│  └─────────────────┘    └─────────────────┘                │
+└─────────────────────────────────────────────────────────────┘
+
+Update Process:
+1. Update pod-N (highest ordinal first)
+2. Wait for pod-N to be ready
+3. Update pod-(N-1)
+4. Continue in reverse order
+5. Each pod maintains its identity and storage
+```
+
+### 2. Storage Patterns Deep Dive
+
+#### Deployment Storage Patterns:
+
+**Shared Storage Pattern:**
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: app
+        image: nginx
+        volumeMounts:
+        - name: shared-content
+          mountPath: /usr/share/nginx/html
+        - name: logs
+          mountPath: /var/log/nginx
+      volumes:
+      - name: shared-content
+        persistentVolumeClaim:
+          claimName: shared-content-pvc  # All pods share this
+      - name: logs
+        emptyDir: {}  # Each pod gets its own log directory
+```
+
+**External Storage Pattern:**
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+spec:
+  template:
+    spec:
+      containers:
+      - name: api
+        image: myapi:latest
+        env:
+        -
